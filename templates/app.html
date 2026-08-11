@@ -536,9 +536,14 @@
 
                 if (data.success) {
                     document.getElementById('modalPlaylistName').textContent = `歌单: ${data.playlist_name}`;
-                    document.getElementById('modalSongCount').textContent = `包含 ${data.song_count} 首歌曲`;
-                    document.getElementById('modalCoverStatus').textContent =
-                        data.cover_generated ? '🎨 封面已自动生成' : '📷 未生成封面';
+                    const requestedCount = data.requested_song_count ?? data.song_count;
+                    const failedCount = data.failed_song_count ?? 0;
+                    document.getElementById('modalSongCount').textContent = failedCount > 0
+                        ? `已添加 ${data.song_count}/${requestedCount} 首歌曲（${failedCount} 首失败）`
+                        : `包含 ${data.song_count} 首歌曲`;
+                    document.getElementById('modalCoverStatus').textContent = data.cover_generated
+                        ? (data.cover_uploaded ? '🎨 封面已上传' : '⚠️ 封面已生成但上传失败')
+                        : '📷 未生成封面';
                     document.getElementById('successModal').classList.remove('hidden');
                 } else {
                     alert('创建失败: ' + (data.detail || '未知错误'));

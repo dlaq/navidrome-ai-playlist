@@ -302,12 +302,24 @@ async def api_create_playlist(req: CreatePlaylistRequest, request: Request):
 
     result = navidrome.create_playlist(req.name, req.song_ids, cover_data=cover_data)
     if result:
+        added_song_ids = result.get("_added_song_ids")
+        failed_song_ids = result.get("_failed_song_ids")
+        if not isinstance(added_song_ids, list):
+            added_song_ids = list(req.song_ids)
+        if not isinstance(failed_song_ids, list):
+            failed_song_ids = []
+        cover_uploaded = bool(result.get("cover_uploaded", False))
+        if cover_data is not None and not cover_uploaded:
+            logger.warning("歌单已创建，但封面未能上传")
         return {
             "success": True,
             "playlist_id": result.get("id"),
             "playlist_name": result.get("name"),
-            "song_count": len(req.song_ids),
+            "song_count": len(added_song_ids),
+            "requested_song_count": len(req.song_ids),
+            "failed_song_count": len(failed_song_ids),
             "cover_generated": cover_data is not None,
+            "cover_uploaded": cover_uploaded,
         }
     else:
         raise HTTPException(500, "创建歌单失败")

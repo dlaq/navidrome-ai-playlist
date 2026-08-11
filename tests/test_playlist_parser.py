@@ -5,12 +5,13 @@ from playlist_parser import fetch_netease_playlist, parse_playlist_url
 
 
 class NeteasePlaylistTests(unittest.TestCase):
-    def test_mobile_hash_url_is_recognized(self):
+    def test_mobile_playlist_url_is_recognized(self):
         url = "https://music.163.com/#/my/m/music/playlist?id=13641085"
-        self.assertEqual(parse_playlist_url(url), ("netease", "13641085"))
+
+        self.assertEqual(("netease", "13641085"), parse_playlist_url(url))
 
     @patch("playlist_parser.requests.get")
-    def test_track_ids_are_fetched_in_batches_and_order_is_preserved(self, get):
+    def test_fetches_all_track_ids_in_batches_and_preserves_order(self, get):
         track_ids = list(range(1, 52))
         playlist_response = Mock()
         playlist_response.json.return_value = {
@@ -21,8 +22,8 @@ class NeteasePlaylistTests(unittest.TestCase):
             },
         }
 
-        first_batch = Mock()
-        first_batch.json.return_value = {
+        first_batch_response = Mock()
+        first_batch_response.json.return_value = {
             "code": 200,
             "songs": [
                 {
@@ -34,8 +35,9 @@ class NeteasePlaylistTests(unittest.TestCase):
                 for song_id in range(1, 51)
             ],
         }
-        second_batch = Mock()
-        second_batch.json.return_value = {
+
+        second_batch_response = Mock()
+        second_batch_response.json.return_value = {
             "code": 200,
             "songs": [
                 {
@@ -46,15 +48,24 @@ class NeteasePlaylistTests(unittest.TestCase):
                 }
             ],
         }
-        get.side_effect = [playlist_response, first_batch, second_batch]
+        get.side_effect = [
+            playlist_response,
+            first_batch_response,
+            second_batch_response,
+        ]
 
         name, songs = fetch_netease_playlist("13641085")
 
-        self.assertEqual(name, "测试歌单")
-        self.assertEqual(len(songs), 51)
-        self.assertEqual([song.title for song in songs], [f"歌曲{i}" for i in track_ids])
-        self.assertIn("/api/v6/playlist/detail?id=13641085", get.call_args_list[0].args[0])
-        self.assertEqual(get.call_count, 3)
+        self.assertEqual("测试歌单", name)
+        self.assertEqual(51, len(songs))
+        self.assertEqual(["歌曲1", "歌曲51"], [songs[0].title, songs[-1].title])
+        self.assertEqual(3, get.call_count)
+        self.assertEqual(
+            "https://music.163.com/api/v6/playlist/detail?id=13641085",
+            get.call_args_list[0].args[0],
+        )
+        self.assertIn("ids=[1,2,3", get.call_args_list[1].args[0])
+        self.assertTrue(get.call_args_list[2].args[0].endswith("ids=[51]"))
 
 
 if __name__ == "__main__":

@@ -12,8 +12,14 @@
 
 ### 🧠 智能匹配
 - 搜索结果自动与你的 Navidrome 曲库匹配
-- 支持精确匹配 + 模糊匹配（容忍歌名差异）
+- 支持跨平台标准化匹配：全角/半角符号、大小写、歌手分隔符、合作艺人、Live、Remix、伴奏、Acoustic 等写法不一致时仍可匹配
+- 使用标题相似度 + 歌手集合评分，避免仅凭歌名把同名歌曲匹配错
 - 显示匹配率和未找到的歌曲列表
+
+### 💾 曲库索引
+- 使用 Navidrome `search3` 分页快速扫描全库，不再逐个遍历艺术家和专辑
+- 曲库元数据持久化到 `/data/navidrome_library.json`
+- 已有缓存时先使用旧索引，后台刷新完成前不会把曲库误判为空
 
 ### 🎨 自动生成封面
 - 根据歌单主题智能生成精美封面
@@ -26,7 +32,7 @@
 
 ### ✅ 一键创建歌单
 - 匹配到的歌曲直接创建为 Navidrome 歌单
-- 封面自动上传到 Navidrome
+- 连接 Songloft Subsonic 插件时，创建歌单后通过 Songloft 原生 API 单独上传封面
 - 支持创建前勾选/取消歌曲
 
 ### 📋 歌单链接导入
@@ -57,6 +63,7 @@ docker build -t navidrome-ai-playlist .
 docker run -d \
   --name navidrome-ai-playlist \
   -p 8899:8899 \
+  -v /你的路径/navidrome-ai-playlist-data:/data \
   -e NAVIDROME_URL=http://你的NAS局域网IP:4533/ \
   -e NAVIDROME_USER=你的Navidrome用户名 \
   -e NAVIDROME_PASS=你的Navidrome密码 \
@@ -79,7 +86,11 @@ docker run -d \
 | `NAVIDROME_USER` | Navidrome 用户名 | `admin` |
 | `NAVIDROME_PASS` | Navidrome 密码 | `your_password` |
 | `LOGIN_PASSWORD` | Web UI 访问密码 | `your_web_password` |
+| `SONGLOFT_API_URL` | Songloft 原生 API 地址（可选，通常可从 Subsonic 插件地址自动推断） | `http://192.168.1.100:58091/api/v1` |
+| `SONGLOFT_ACCESS_TOKEN` | Songloft 原生 API Access Token（可选；不设置时使用账号自动登录） | — |
 | `PORT` | 服务端口（可选，默认 8899） | `8899` |
+| `LIBRARY_CACHE_PATH` | 曲库缓存文件路径（可选） | `/data/navidrome_library.json` |
+| `LIBRARY_CACHE_TTL` | 自动刷新间隔秒数（可选，默认 3600） | `3600` |
 
 ## 🎯 使用方法
 
@@ -161,8 +172,12 @@ navidrome-ai-playlist/
 ## ⚠️ 注意事项
 
 - 首次启动会后台加载歌曲库（曲库越大加载越慢）
+- 首次扫描完成前，匹配接口会提示“曲库正在首次加载”，不会返回误导性的 0 首匹配
+- 创建歌单时先无封面创建，再按每批最多 50 首添加歌曲；失败批次会重试并二分隔离坏歌曲
+- 使用 Songloft 时，`NAVIDROME_URL` 填写 Subsonic 插件地址（例如 `http://服务器:58091/api/v1/jsplugin/subsonic/`），程序会自动推断原生 API 地址
+- 使用 `docker run` 时建议挂载 `/data`；否则删除容器后曲库缓存也会随容器删除
 - 搜索结果取决于各音乐平台 API 的可用性
-- 匹配算法包含精确匹配和模糊匹配，但可能有遗漏
+- 匹配结果会显示匹配分数；低置信度结果会标记为“模糊”供人工确认
 - 不要在 `docker-compose.yml` 或命令行中泄露你的密码配置
 
 ## 📄 License

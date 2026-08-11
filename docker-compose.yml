@@ -12,6 +12,8 @@ services:
       NAVIDROME_USER: "${NAVIDROME_USER:?set NAVIDROME_USER in .env or the shell}"
       NAVIDROME_PASS: "${NAVIDROME_PASS:?set NAVIDROME_PASS in .env or the shell}"
       LOGIN_PASSWORD: "${LOGIN_PASSWORD:?set LOGIN_PASSWORD in .env or the shell}"
+      SONGLOFT_API_URL: "${SONGLOFT_API_URL:-}"
+      SONGLOFT_ACCESS_TOKEN: "${SONGLOFT_ACCESS_TOKEN:-}"
       PORT: "8899"
       LIBRARY_CACHE_PATH: "/data/navidrome_library.json"
       LIBRARY_CACHE_TTL: "3600"
