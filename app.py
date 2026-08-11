@@ -7,7 +7,8 @@ import time
 import logging
 import secrets
 import threading
-from typing import Optional
+import tempfile
+from typing import Any, List, Optional
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response, HTTPException, Form
@@ -18,9 +19,10 @@ from pydantic import BaseModel
 
 import config
 from searchers import search_all, search_all_merged, Song
-from navidrome_client import NavidromeClient
+from navidrome_client import NavidromeClient, NavidromeSong
 from cover_generator import generate_cover, THEME_COLORS
 from playlist_parser import fetch_playlist_from_url, parse_playlist_url
+from matching import deduplicate_songs, match_songs
 
 # 日志配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -38,9 +40,24 @@ active_sessions = {}
 # Navidrome 客户端
 navidrome = NavidromeClient(config.NAVIDROME_URL, config.NAVIDROME_USER, config.NAVIDROME_PASS)
 
-# 歌曲库缓存
-library_cache = {"songs": [], "last_update": 0, "loading": False}
-CACHE_TTL = 600  # 10分钟刷新一次
+# 歌曲库缓存。歌曲元数据保存到 Docker 的 /data 目录，容器重启后可以直接
+# 使用旧索引；后台刷新完成前仍允许使用旧索引，避免再次出现“曲库为空”的
+# 竞态。首次启动且没有缓存时，匹配接口会明确返回“加载中”，不会伪装成
+# 0 首匹配。
+library_cache = {
+    "songs": [],
+    "last_update": 0,
+    "loading": False,
+    "error": None,
+    "source": None,
+}
+library_lock = threading.RLock()
+CACHE_TTL = config.LIBRARY_CACHE_TTL
+LIBRARY_CACHE_PATH = Path(config.LIBRARY_CACHE_PATH)
+
+
+class LibraryNotReadyError(RuntimeError):
+    """Raised when matching is requested before the first library scan ends."""
 
 
 # ==================== 中间件 ====================
@@ -123,10 +140,18 @@ class PlaylistUrlRequest(BaseModel):
 async def api_status(request: Request):
     require_auth(request)
     connected = navidrome.ping()
+    with library_lock:
+        library_size = len(library_cache.get("songs", []))
+        library_loading = library_cache.get("loading", False)
+        last_update = library_cache.get("last_update", 0)
+        library_error = library_cache.get("error")
     return {
         "navidrome_connected": connected,
-        "library_size": len(library_cache.get("songs", [])),
-        "library_loading": library_cache.get("loading", False),
+        "library_size": library_size,
+        "library_loading": library_loading,
+        "library_ready": bool(last_update),
+        "library_last_update": last_update,
+        "library_error": library_error,
     }
 
 @app.post("/api/search")
@@ -171,6 +196,12 @@ async def api_match(req: MatchRequest, request: Request):
     if not req.query.strip():
         raise HTTPException(400, "搜索关键词不能为空")
 
+    # 先确认曲库已可用，首次扫描期间直接提示用户，不浪费时间请求各平台。
+    try:
+        _get_library()
+    except LibraryNotReadyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     # 1. 从各平台搜索
     logger.info(f"匹配搜索: {req.query}")
     from searchers import ALL_SEARCHERS, Song
@@ -190,59 +221,11 @@ async def api_match(req: MatchRequest, request: Request):
             logger.error(f"[{name}] 搜索失败: {e}")
             source_stats[name] = 0
 
-    # 2. 去重
-    seen = set()
-    unique_songs = []
-    for song in all_search_songs:
-        key = song.match_key
-        if key not in seen:
-            seen.add(key)
-            unique_songs.append(song)
-
-    # 3. 与 Navidrome 库匹配
-    library = _get_library()
-    lib_index = {}
-    for ls in library:
-        key = ls.match_key
-        if key not in lib_index:
-            lib_index[key] = ls
-
-    matched = []
-    unmatched = []
-    for song in unique_songs:
-        key = song.match_key
-        if key in lib_index:
-            ns = lib_index[key]
-            matched.append({
-                "title": ns.title,
-                "artist": ns.artist,
-                "album": ns.album,
-                "id": ns.id,
-                "source": song.source,
-            })
-        else:
-            # 尝试模糊匹配：只要歌名包含
-            found = False
-            title_clean = re.sub(r'[\s\-\(\)（）]', '', song.title.lower())
-            for lk, ls in lib_index.items():
-                lib_title = re.sub(r'[\s\-\(\)（）]', '', ls.title.lower())
-                if title_clean and lib_title and (title_clean in lib_title or lib_title in title_clean):
-                    if len(title_clean) >= 2:  # 避免太短的误匹配
-                        matched.append({
-                            "title": ls.title,
-                            "artist": ls.artist,
-                            "album": ls.album,
-                            "id": ls.id,
-                            "source": f"{song.source}(模糊)",
-                        })
-                        found = True
-                        break
-            if not found:
-                unmatched.append({
-                    "title": song.title,
-                    "artist": song.artist,
-                    "source": song.source,
-                })
+    # 2. 与 Navidrome 库匹配
+    try:
+        matched, unmatched, unique_songs = _match_source_songs(all_search_songs)
+    except LibraryNotReadyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     return {
         "query": req.query,
@@ -261,6 +244,11 @@ async def api_playlist_from_url(req: PlaylistUrlRequest, request: Request):
     if not req.url.strip():
         raise HTTPException(400, "链接不能为空")
 
+    try:
+        _get_library()
+    except LibraryNotReadyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     logger.info(f"解析歌单链接: {req.url}")
 
     # 1. 从URL获取歌单歌曲
@@ -275,60 +263,11 @@ async def api_playlist_from_url(req: PlaylistUrlRequest, request: Request):
     if not url_songs:
         raise HTTPException(400, "未能从该链接获取到歌曲")
 
-    # 2. 去重
-    seen = set()
-    unique_songs = []
-    for song in url_songs:
-        key = song.match_key
-        if key not in seen:
-            seen.add(key)
-            unique_songs.append(song)
-
-    # 3. 与 Navidrome 库匹配
-    import re
-    library = _get_library()
-    lib_index = {}
-    for ls in library:
-        key = ls.match_key
-        if key not in lib_index:
-            lib_index[key] = ls
-
-    matched = []
-    unmatched = []
-    for song in unique_songs:
-        key = song.match_key
-        if key in lib_index:
-            ns = lib_index[key]
-            matched.append({
-                "title": ns.title,
-                "artist": ns.artist,
-                "album": ns.album,
-                "id": ns.id,
-                "source": song.source,
-            })
-        else:
-            # 模糊匹配
-            found = False
-            title_clean = re.sub(r'[\s\-\(\)（）]', '', song.title.lower())
-            for lk, ls in lib_index.items():
-                lib_title = re.sub(r'[\s\-\(\)（）]', '', ls.title.lower())
-                if title_clean and lib_title and (title_clean in lib_title or lib_title in title_clean):
-                    if len(title_clean) >= 2:
-                        matched.append({
-                            "title": ls.title,
-                            "artist": ls.artist,
-                            "album": ls.album,
-                            "id": ls.id,
-                            "source": f"{song.source}(模糊)",
-                        })
-                        found = True
-                        break
-            if not found:
-                unmatched.append({
-                    "title": song.title,
-                    "artist": song.artist,
-                    "source": song.source,
-                })
+    # 2. 与 Navidrome 库匹配
+    try:
+        matched, unmatched, unique_songs = _match_source_songs(url_songs)
+    except LibraryNotReadyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     return {
         "playlist_name": playlist_name,
@@ -404,37 +343,186 @@ async def api_playlists(request: Request):
 @app.post("/api/library/refresh")
 async def api_refresh_library(request: Request):
     require_auth(request)
-    _refresh_library()
-    return {"status": "ok", "count": len(library_cache.get("songs", []))}
+    started = _refresh_library(force=True)
+    with library_lock:
+        count = len(library_cache.get("songs", []))
+        loading = library_cache.get("loading", False)
+        ready = bool(library_cache.get("last_update", 0))
+        error = library_cache.get("error")
+    return {
+        "status": "loading" if loading else "ok",
+        "started": started,
+        "count": count,
+        "library_ready": ready,
+        "error": error,
+    }
 
 
 # ==================== 辅助函数 ====================
-import re
+def _match_source_songs(source_songs: List[Any]):
+    """Match source songs against the current persistent/in-memory library."""
+
+    unique_songs = deduplicate_songs(source_songs)
+    library = _get_library()
+    results, unmatched_songs = match_songs(unique_songs, library)
+
+    matched = []
+    for result in results:
+        source_song = result.source_song
+        source_name = getattr(source_song, "source", "") if source_song else ""
+        source_name = source_name or "匹配"
+        label = source_name if result.method in {"title+artist", "title"} else f"{source_name}(模糊)"
+        nav_song = result.library_song
+        matched.append({
+            "title": nav_song.title,
+            "artist": nav_song.artist,
+            "album": nav_song.album,
+            "id": nav_song.id,
+            "source": label,
+            "match_score": round(result.score * 100, 1),
+            "match_method": result.method,
+        })
+
+    unmatched = [
+        {
+            "title": song.title,
+            "artist": song.artist,
+            "album": getattr(song, "album", ""),
+            "source": getattr(song, "source", "") or "未知来源",
+        }
+        for song in unmatched_songs
+    ]
+    return matched, unmatched, unique_songs
+
 
 def _get_library():
-    """获取歌曲库（带缓存）"""
-    now = time.time()
-    if now - library_cache.get("last_update", 0) > CACHE_TTL:
-        _refresh_library()
-    return library_cache.get("songs", [])
+    """获取歌曲库（支持持久化、后台刷新和 stale-while-refresh）。"""
 
-def _refresh_library():
-    """刷新歌曲库（后台线程）"""
-    if library_cache.get("loading"):
+    now = time.time()
+    with library_lock:
+        songs = list(library_cache.get("songs", []))
+        last_update = library_cache.get("last_update", 0)
+        loading = library_cache.get("loading", False)
+        error = library_cache.get("error")
+
+    if not last_update:
+        _refresh_library()
+        with library_lock:
+            songs = list(library_cache.get("songs", []))
+            last_update = library_cache.get("last_update", 0)
+            loading = library_cache.get("loading", False)
+            error = library_cache.get("error")
+        if not songs and not last_update:
+            detail = "Navidrome 曲库正在首次加载，请等待扫描完成后再试"
+            if error:
+                detail += f"（最近一次错误：{error}）"
+            raise LibraryNotReadyError(detail)
+        return songs
+
+    # 有旧缓存时返回旧数据，同时后台刷新；用户不会再看到短暂的空曲库。
+    if CACHE_TTL > 0 and now - last_update > CACHE_TTL and not loading:
+        _refresh_library()
+    return songs
+
+
+def _persist_library(songs: List[NavidromeSong], updated_at: float) -> None:
+    """Atomically write the library cache so an interrupted scan is harmless."""
+
+    payload = {
+        "version": 1,
+        "updated_at": updated_at,
+        "songs": [song.to_dict() for song in songs],
+    }
+    try:
+        LIBRARY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(LIBRARY_CACHE_PATH.parent),
+                prefix=f".{LIBRARY_CACHE_PATH.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_name = handle.name
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, LIBRARY_CACHE_PATH)
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
+        logger.info(f"曲库缓存已持久化: {LIBRARY_CACHE_PATH} ({len(songs)} 首)")
+    except Exception as e:
+        # Cache persistence must never make a successful Navidrome scan fail.
+        logger.warning(f"曲库缓存持久化失败，将继续使用内存缓存: {e}")
+
+
+def _load_persisted_library() -> None:
+    """Load a previous cache before the web server starts."""
+
+    if not LIBRARY_CACHE_PATH.exists():
         return
-    library_cache["loading"] = True
+    try:
+        with LIBRARY_CACHE_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, list):
+            raw_songs = payload
+            updated_at = LIBRARY_CACHE_PATH.stat().st_mtime
+        else:
+            raw_songs = payload.get("songs", [])
+            updated_at = float(payload.get("updated_at", 0))
+        songs = [NavidromeSong.from_dict(item) for item in raw_songs if isinstance(item, dict)]
+        with library_lock:
+            library_cache["songs"] = songs
+            library_cache["last_update"] = updated_at
+            library_cache["source"] = "disk"
+            library_cache["error"] = None
+        logger.info(f"已加载持久化曲库缓存: {len(songs)} 首歌曲")
+    except Exception as e:
+        logger.warning(f"读取曲库缓存失败，将重新扫描 Navidrome: {e}")
+
+
+def _refresh_library(force: bool = False) -> bool:
+    """Start one background library refresh and return whether it started."""
+
+    now = time.time()
+    with library_lock:
+        if library_cache.get("loading"):
+            return False
+        if not force and library_cache.get("last_update", 0):
+            if CACHE_TTL <= 0 or now - library_cache["last_update"] <= CACHE_TTL:
+                return False
+        library_cache["loading"] = True
+        library_cache["error"] = None
+
     def _do_refresh():
         try:
-            logger.info("正在刷新歌曲库...")
-            songs = navidrome.get_all_songs()
-            library_cache["songs"] = songs
-            library_cache["last_update"] = time.time()
+            logger.info("正在刷新歌曲库（search3 分页扫描）...")
+            songs = navidrome.get_all_songs(page_size=config.LIBRARY_SCAN_PAGE_SIZE)
+            updated_at = time.time()
+            with library_lock:
+                library_cache["songs"] = songs
+                library_cache["last_update"] = updated_at
+                library_cache["source"] = "navidrome"
+                library_cache["error"] = None
+            _persist_library(songs, updated_at)
             logger.info(f"歌曲库已更新: {len(songs)} 首歌曲")
         except Exception as e:
-            logger.error(f"刷新歌曲库失败: {e}")
+            with library_lock:
+                library_cache["error"] = str(e)
+            logger.error(f"刷新歌曲库失败: {e}", exc_info=True)
         finally:
-            library_cache["loading"] = False
-    threading.Thread(target=_do_refresh, daemon=True).start()
+            with library_lock:
+                library_cache["loading"] = False
+
+    threading.Thread(target=_do_refresh, name="library-refresh", daemon=True).start()
+    return True
+
+
+# 让通过 uvicorn 导入 app 模块的部署方式也能立即使用已有缓存。
+_load_persisted_library()
 
 
 # ==================== 启动 ====================
@@ -444,8 +532,12 @@ if __name__ == "__main__":
     try:
         logger.info(f"正在连接 Navidrome: {config.NAVIDROME_URL}")
         if navidrome.ping():
-            logger.info("Navidrome 连接成功！正在后台加载歌曲库...")
-            _refresh_library()
+            if _refresh_library():
+                logger.info("Navidrome 连接成功！正在后台刷新歌曲库...")
+            else:
+                with library_lock:
+                    cached_count = len(library_cache.get("songs", []))
+                logger.info(f"Navidrome 连接成功！使用已有曲库缓存（{cached_count} 首）")
         else:
             logger.warning("Navidrome 连接失败，将在首次请求时重试")
     except Exception as e:

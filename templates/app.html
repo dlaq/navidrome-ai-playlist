@@ -41,6 +41,7 @@
         <h1 class="text-xl md:text-2xl font-bold text-white">🎵 Navidrome AI 歌单生成器</h1>
         <div class="flex items-center gap-4">
             <span id="status-indicator" class="text-sm text-gray-400">检查连接中...</span>
+            <button onclick="refreshLibrary()" id="refreshLibraryBtn" class="text-sm text-indigo-400 hover:text-indigo-300 transition">刷新曲库</button>
             <a href="/logout" class="text-sm text-gray-400 hover:text-white transition">退出</a>
         </div>
     </div>
@@ -237,7 +238,10 @@
                 const data = await resp.json();
                 const el = document.getElementById('status-indicator');
                 if (data.navidrome_connected) {
-                    el.innerHTML = `<span class="text-green-400">● 已连接</span> · 曲库 ${data.library_size} 首`;
+                    const libraryText = data.library_loading
+                        ? `曲库正在加载（当前 ${data.library_size} 首）`
+                        : `曲库 ${data.library_size} 首`;
+                    el.innerHTML = `<span class="text-green-400">● 已连接</span> · ${libraryText}`;
                 } else {
                     el.innerHTML = `<span class="text-red-400">● 连接失败</span>`;
                 }
@@ -246,6 +250,32 @@
             }
         }
         checkStatus();
+
+        // 手动刷新曲库。已有缓存不会被清空，刷新期间仍可继续使用旧索引。
+        async function refreshLibrary() {
+            const btn = document.getElementById('refreshLibraryBtn');
+            btn.disabled = true;
+            btn.textContent = '刷新中...';
+            try {
+                const resp = await fetch('/api/library/refresh', {method: 'POST'});
+                const data = await resp.json();
+                if (resp.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+                if (!resp.ok) {
+                    alert(data.detail || data.error || '刷新曲库失败');
+                    return;
+                }
+                alert(data.started ? '曲库刷新已开始，完成后会自动使用最新索引' : '曲库正在刷新中');
+                checkStatus();
+            } catch (e) {
+                alert('刷新曲库失败: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '刷新曲库';
+            }
+        }
 
         // 加载封面主题
         async function loadThemes() {
@@ -347,6 +377,16 @@
                     return;
                 }
 
+                if (resp.status === 409) {
+                    alert(data.detail || '曲库正在加载，请稍后重试');
+                    checkStatus();
+                    return;
+                }
+                if (!resp.ok) {
+                    alert(data.detail || '搜索失败');
+                    return;
+                }
+
                 displayResults(data, playlistName);
                 // 搜索完成后刷新封面预览
                 refreshCoverPreview();
@@ -389,6 +429,7 @@
             } else {
                 matchedSongs.forEach((song, idx) => {
                     const checked = selectedIds.has(song.id) ? 'selected' : '';
+                    const scoreText = song.match_score !== undefined ? ` · ${song.match_score}%` : '';
                     listEl.innerHTML += `
                         <div class="song-item flex items-center gap-3 px-4 py-3 border-b border-white/5 cursor-pointer ${checked}"
                              data-id="${song.id}" onclick="toggleSong('${song.id}', this)">
@@ -398,7 +439,7 @@
                                 <div class="text-white truncate">${escapeHtml(song.title)}</div>
                                 <div class="text-gray-400 text-sm truncate">${escapeHtml(song.artist)}${song.album ? ' · ' + escapeHtml(song.album) : ''}</div>
                             </div>
-                            <span class="source-badge badge-${song.source?.replace('(模糊)', '')}">${song.source}</span>
+                            <span class="source-badge badge-${song.source?.replace('(模糊)', '')}" title="匹配方式：${escapeHtml(song.match_method || '标准化匹配')}">${escapeHtml(song.source)}${scoreText}</span>
                         </div>
                     `;
                 });
@@ -550,6 +591,15 @@
 
                 if (resp.status === 400) {
                     alert(data.detail || '链接格式不支持');
+                    return;
+                }
+                if (resp.status === 409) {
+                    alert(data.detail || '曲库正在加载，请稍后重试');
+                    checkStatus();
+                    return;
+                }
+                if (!resp.ok) {
+                    alert(data.detail || '导入失败');
                     return;
                 }
 

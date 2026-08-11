@@ -8,6 +8,8 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 import requests
 
+from matching import song_dedupe_key
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -22,12 +24,8 @@ class Song:
 
     @property
     def match_key(self) -> str:
-        """用于匹配的标准化 key"""
-        t = re.sub(r'[\s\-\(\)（）\[\]【】「」《》]', '', self.title.lower())
-        a = re.sub(r'[\s\-\(\)（）\[\]【】「」《》]', '', self.artist.lower())
-        t = re.sub(r'feat\.?|ft\.?|合唱|对唱|live|remix|cover|翻唱|伴奏|dj.*版|完整版', '', t)
-        a = re.sub(r'feat\.?|ft\.?|&|、|，', '', a)
-        return f"{t}|{a}"
+        """用于去重的标准化 key（保留 Live/Remix 等版本差异）。"""
+        return song_dedupe_key(self)
 
 
 HEADERS = {

@@ -65,31 +65,35 @@ def parse_playlist_url(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def fetch_netease_songs_detail(song_ids: List[int], batch_size: int = 50) -> dict:
-    """分批获取网易云歌曲详情，返回以歌曲 ID 为键的字典。"""
+    """
+    批量获取网易云音乐歌曲详情
+
+    Args:
+        song_ids: 歌曲ID列表
+        batch_size: 每次请求的歌曲数量（网易云API限制单次最多50首）
+
+    Returns:
+        {song_id: song_info} 的字典
+    """
     songs_detail = {}
 
+    # 分批请求（防止URL过长）
     for i in range(0, len(song_ids), batch_size):
         batch_ids = song_ids[i:i + batch_size]
-        id_str = ','.join(str(song_id) for song_id in batch_ids)
+        id_str = ','.join(str(sid) for sid in batch_ids)
 
         try:
             url = f"https://music.163.com/api/song/detail?ids=[{id_str}]"
-            resp = requests.get(
-                url,
-                headers={**HEADERS, 'Referer': 'https://music.163.com/'},
-                timeout=15,
-            )
-            resp.raise_for_status()
+            resp = requests.get(url, headers={**HEADERS, 'Referer': 'https://music.163.com/'}, timeout=15)
             data = resp.json()
 
-            if data.get('code') != 200:
-                logger.warning(f"获取歌曲详情 API 返回非 200: {data.get('code')}")
-                continue
-
-            for song in data.get('songs', []):
-                song_id = song.get('id')
-                if song_id is not None:
-                    songs_detail[song_id] = song
+            if data.get('code') == 200:
+                for song in data.get('songs', []):
+                    song_id = song.get('id')
+                    if song_id:
+                        songs_detail[song_id] = song
+            else:
+                logger.warning(f"获取歌曲详情API返回非200: {data.get('code')}")
 
         except Exception as e:
             logger.error(f"获取歌曲详情失败 (IDs: {id_str[:100]}...): {e}")
@@ -98,34 +102,61 @@ def fetch_netease_songs_detail(song_ids: List[int], batch_size: int = 50) -> dic
 
 
 def fetch_netease_playlist(playlist_id: str) -> Tuple[str, List[Song]]:
-    """通过 trackIds 获取网易云歌单中的全部歌曲。"""
+    """获取网易云音乐歌单
+
+    解决方案：
+    1. 调用 /api/v6/playlist/detail 获取歌单基本信息
+    2. 从响应中获取 trackIds（所有歌曲ID）
+    3. 调用 /song/detail API 批量获取这些ID的歌曲详情
+    4. 构建完整的歌曲列表
+    """
     try:
+        # 第一步：获取歌单基本信息和歌曲ID列表
+        # 旧的 /api/playlist/detail 对部分歌单返回 code=20001；v6 接口
+        # 会返回完整的 trackIds，随后再批量查询歌曲详情。
         url = f"https://music.163.com/api/v6/playlist/detail?id={playlist_id}"
-        resp = requests.get(
-            url,
-            headers={**HEADERS, 'Referer': 'https://music.163.com/'},
-            timeout=15,
-        )
-        resp.raise_for_status()
+        resp = requests.get(url, headers={**HEADERS, 'Referer': 'https://music.163.com/'}, timeout=15)
         data = resp.json()
 
+        # 检查返回状态
         if data.get('code') != 200:
-            logger.warning(f"网易云 API 返回非 200 状态: {data.get('code')}")
+            logger.warning(f"网易云API返回非200状态: {data.get('code')}")
             return ('网易云歌单', [])
 
-        result = data.get('playlist') or data.get('result') or {}
+        # 获取歌单信息
+        result = data.get('result') or data.get('playlist', {})
         playlist_name = result.get('name', '网易云歌单')
-        track_ids = [
-            item.get('id') if isinstance(item, dict) else item
-            for item in result.get('trackIds', [])
-        ]
-        track_ids = [song_id for song_id in track_ids if song_id is not None]
 
-        if not track_ids:
+        # 获取歌曲ID列表
+        track_ids_raw = result.get('trackIds', [])
+        if not track_ids_raw:
             logger.warning(f"网易云歌单 '{playlist_name}': 没有 trackIds")
             return (playlist_name, [])
 
+        # 提取ID（trackIds 可能是 [{"id": 123}, ...] 或 [123, ...]）
+        track_ids = []
+        for item in track_ids_raw:
+            if isinstance(item, dict):
+                track_ids.append(item.get('id'))
+            else:
+                track_ids.append(item)
+
+        track_ids = [tid for tid in track_ids if tid]  # 过滤 None 值
+
+        if not track_ids:
+            logger.warning(f"网易云歌单 '{playlist_name}': trackIds 处理后为空")
+            return (playlist_name, [])
+
+        logger.info(f"网易云歌单 '{playlist_name}': 发现 {len(track_ids)} 首歌曲，开始获取详情...")
+
+        # 第二步：批量获取歌曲详情
         songs_detail = fetch_netease_songs_detail(track_ids)
+
+        if not songs_detail:
+            logger.warning(f"网易云歌单 '{playlist_name}': 无法获取歌曲详情")
+            return (playlist_name, [])
+
+        # 第三步：构建 Song 对象列表
         songs = []
         failed_count = 0
 
@@ -137,34 +168,24 @@ def fetch_netease_playlist(playlist_id: str) -> Tuple[str, List[Song]]:
 
             title = song_info.get('name', '')
             artists_list = song_info.get('artists', song_info.get('ar', []))
-            artists = '/'.join(
-                artist.get('name', '') for artist in artists_list
-                if artist.get('name')
-            )
+            artists = '/'.join([a.get('name', '') for a in artists_list]) if artists_list else ''
+
             album_info = song_info.get('album', song_info.get('al', {}))
             album = album_info.get('name', '') if isinstance(album_info, dict) else ''
 
             if title and artists:
-                songs.append(
-                    Song(
-                        title=title,
-                        artist=artists,
-                        album=album,
-                        source='网易',
-                    )
-                )
+                songs.append(Song(title=title, artist=artists, album=album, source='网易'))
             else:
                 failed_count += 1
+                logger.debug(f"歌曲信息不完整: id={song_id}, title={title}, artists={artists}")
 
-        logger.info(
-            f"网易云歌单 '{playlist_name}': 成功获取 {len(songs)} 首歌曲 "
-            f"(失败 {failed_count} 首)"
-        )
+        logger.info(f"网易云歌单 '{playlist_name}': 成功获取 {len(songs)} 首歌曲 (失败 {failed_count} 首)")
         return (playlist_name, songs)
 
     except Exception as e:
         logger.error(f"获取网易云歌单失败: {e}", exc_info=True)
         return ('网易云歌单', [])
+
 
 def fetch_qq_playlist(playlist_id: str) -> Tuple[str, List[Song]]:
     """获取QQ音乐歌单"""

@@ -5,9 +5,13 @@ services:
     restart: unless-stopped
     ports:
       - "8899:8899"
+    volumes:
+      - ./data:/data
     environment:
-      NAVIDROME_URL: "http://j.tthsdd.top:4533/"
-      NAVIDROME_USER: "ccson"
-      NAVIDROME_PASS: "shaozi1981"
-      LOGIN_PASSWORD: "navidrome2024"
+      NAVIDROME_URL: "${NAVIDROME_URL:?set NAVIDROME_URL in .env or the shell}"
+      NAVIDROME_USER: "${NAVIDROME_USER:?set NAVIDROME_USER in .env or the shell}"
+      NAVIDROME_PASS: "${NAVIDROME_PASS:?set NAVIDROME_PASS in .env or the shell}"
+      LOGIN_PASSWORD: "${LOGIN_PASSWORD:?set LOGIN_PASSWORD in .env or the shell}"
       PORT: "8899"
+      LIBRARY_CACHE_PATH: "/data/navidrome_library.json"
+      LIBRARY_CACHE_TTL: "3600"
