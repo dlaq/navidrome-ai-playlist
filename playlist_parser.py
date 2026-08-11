@@ -64,32 +64,107 @@ def parse_playlist_url(url: str) -> Tuple[Optional[str], Optional[str]]:
     return (None, None)
 
 
+def fetch_netease_songs_detail(song_ids: List[int], batch_size: int = 50) -> dict:
+    """分批获取网易云歌曲详情，返回以歌曲 ID 为键的字典。"""
+    songs_detail = {}
+
+    for i in range(0, len(song_ids), batch_size):
+        batch_ids = song_ids[i:i + batch_size]
+        id_str = ','.join(str(song_id) for song_id in batch_ids)
+
+        try:
+            url = f"https://music.163.com/api/song/detail?ids=[{id_str}]"
+            resp = requests.get(
+                url,
+                headers={**HEADERS, 'Referer': 'https://music.163.com/'},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get('code') != 200:
+                logger.warning(f"获取歌曲详情 API 返回非 200: {data.get('code')}")
+                continue
+
+            for song in data.get('songs', []):
+                song_id = song.get('id')
+                if song_id is not None:
+                    songs_detail[song_id] = song
+
+        except Exception as e:
+            logger.error(f"获取歌曲详情失败 (IDs: {id_str[:100]}...): {e}")
+
+    return songs_detail
+
+
 def fetch_netease_playlist(playlist_id: str) -> Tuple[str, List[Song]]:
-    """获取网易云音乐歌单"""
+    """通过 trackIds 获取网易云歌单中的全部歌曲。"""
     try:
-        # 使用 Web API 获取歌单详情
-        url = f"http://music.163.com/api/playlist/detail?id={playlist_id}"
-        resp = requests.get(url, headers={**HEADERS, 'Referer': 'https://music.163.com/'}, timeout=15)
+        url = f"https://music.163.com/api/v6/playlist/detail?id={playlist_id}"
+        resp = requests.get(
+            url,
+            headers={**HEADERS, 'Referer': 'https://music.163.com/'},
+            timeout=15,
+        )
+        resp.raise_for_status()
         data = resp.json()
-        result = data.get('result', data.get('playlist', {}))
+
+        if data.get('code') != 200:
+            logger.warning(f"网易云 API 返回非 200 状态: {data.get('code')}")
+            return ('网易云歌单', [])
+
+        result = data.get('playlist') or data.get('result') or {}
         playlist_name = result.get('name', '网易云歌单')
-        tracks = result.get('tracks', [])
+        track_ids = [
+            item.get('id') if isinstance(item, dict) else item
+            for item in result.get('trackIds', [])
+        ]
+        track_ids = [song_id for song_id in track_ids if song_id is not None]
 
+        if not track_ids:
+            logger.warning(f"网易云歌单 '{playlist_name}': 没有 trackIds")
+            return (playlist_name, [])
+
+        songs_detail = fetch_netease_songs_detail(track_ids)
         songs = []
-        for track in tracks:
-            title = track.get('name', '')
-            artists = '/'.join([a.get('name', '') for a in track.get('artists', track.get('ar', []))])
-            album = track.get('album', track.get('al', {})).get('name', '')
-            if title and artists:
-                songs.append(Song(title=title, artist=artists, album=album, source='网易'))
+        failed_count = 0
 
-        logger.info(f"网易云歌单 '{playlist_name}': {len(songs)} 首歌曲")
+        for song_id in track_ids:
+            song_info = songs_detail.get(song_id)
+            if not song_info:
+                failed_count += 1
+                continue
+
+            title = song_info.get('name', '')
+            artists_list = song_info.get('artists', song_info.get('ar', []))
+            artists = '/'.join(
+                artist.get('name', '') for artist in artists_list
+                if artist.get('name')
+            )
+            album_info = song_info.get('album', song_info.get('al', {}))
+            album = album_info.get('name', '') if isinstance(album_info, dict) else ''
+
+            if title and artists:
+                songs.append(
+                    Song(
+                        title=title,
+                        artist=artists,
+                        album=album,
+                        source='网易',
+                    )
+                )
+            else:
+                failed_count += 1
+
+        logger.info(
+            f"网易云歌单 '{playlist_name}': 成功获取 {len(songs)} 首歌曲 "
+            f"(失败 {failed_count} 首)"
+        )
         return (playlist_name, songs)
 
     except Exception as e:
-        logger.error(f"获取网易云歌单失败: {e}")
+        logger.error(f"获取网易云歌单失败: {e}", exc_info=True)
         return ('网易云歌单', [])
-
 
 def fetch_qq_playlist(playlist_id: str) -> Tuple[str, List[Song]]:
     """获取QQ音乐歌单"""
